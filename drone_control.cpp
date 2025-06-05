@@ -1,4 +1,4 @@
-// drone_control.cpp - COMPLETE READY-TO-RUN DRONE FLIGHT CONTROL SYSTEM
+// drone_control.cpp - FHL-LD19 LIDAR COMPATIBLE DRONE FLIGHT CONTROL SYSTEM
 // Compile: g++ -std=c++17 -O2 -o drone_control drone_control.cpp -lpthread -lrt
 // Run: sudo ./drone_control
 
@@ -20,6 +20,7 @@
 #include <iomanip>
 #include <fstream>
 #include <algorithm>
+#include <queue>
 
 // Constants
 constexpr float PI = 3.14159265359f;
@@ -29,6 +30,7 @@ constexpr int PWM_MIN = 1000;
 constexpr int PWM_MAX = 2000;
 constexpr int PWM_ARM = 1100;
 constexpr float OBSTACLE_THRESHOLD = 1.0f; // 1 meter
+constexpr float CRITICAL_OBSTACLE_THRESHOLD = 0.5f; // 0.5 meter
 
 // Global shutdown flag
 std::atomic<bool> g_shutdown(false);
@@ -54,10 +56,18 @@ struct GPSData {
     uint64_t timestamp = 0;
 };
 
+// Enhanced Lidar data structure for FHL-LD19
+struct LidarPoint {
+    float angle;      // Angle in degrees
+    float distance;   // Distance in meters
+    uint8_t confidence; // Confidence/intensity value
+};
+
 struct LidarData {
-    float distance = 10.0f;    // Distance in meters
-    uint16_t strength = 0; // Signal strength
+    std::vector<LidarPoint> points;
+    float rpm = 0;    // Rotation speed
     bool valid = false;
+    std::mutex mutex;
 };
 
 struct DroneState {
@@ -291,7 +301,7 @@ public:
     }
 };
 
-// QMC5883L Magnetometer Driver
+// QMC5883L Magnetometer Driver (GEPRC GEP-M10 integrated)
 class QMC5883L : public I2CDevice {
 private:
     static constexpr int QMC5883L_ADDR = 0x0D;
@@ -328,7 +338,7 @@ public:
     }
 };
 
-// DPS310 Barometer Driver
+// DPS310 Barometer Driver (GEPRC GEP-M10 integrated)
 class DPS310 : public I2CDevice {
 private:
     static constexpr int DPS310_ADDR = 0x77;
@@ -424,17 +434,161 @@ public:
     }
 };
 
-// TFmini Plus Lidar Driver
-class TFminiPlus {
+// FHL-LD19 360° Lidar Driver
+class FHL_LD19_Lidar {
 private:
     int fd = -1;
-    static constexpr uint8_t FRAME_HEADER = 0x59;
+    std::thread read_thread;
+    LidarData& lidar_data;
+    std::queue<uint8_t> buffer_queue;
+    std::mutex queue_mutex;
+    
+    static constexpr uint8_t HEADER = 0x54;
+    static constexpr uint8_t VERLEN = 0x2C;
+    static constexpr int PACKET_SIZE = 47;
+    static constexpr int POINTS_PER_PACKET = 12;
+    
+    // CRC calculation table
+    static constexpr uint8_t CrcTable[256] = {
+        0x00, 0x4d, 0x9a, 0xd7, 0x79, 0x34, 0xe3, 0xae, 0xf2, 0xbf, 0x68, 0x25,
+        0x8b, 0xc6, 0x11, 0x5c, 0xa9, 0xe4, 0x33, 0x7e, 0xd0, 0x9d, 0x4a, 0x07,
+        0x5b, 0x16, 0xc1, 0x8c, 0x22, 0x6f, 0xb8, 0xf5, 0x1f, 0x52, 0x85, 0xc8,
+        0x66, 0x2b, 0xfc, 0xb1, 0xed, 0xa0, 0x77, 0x3a, 0x94, 0xd9, 0x0e, 0x43,
+        0xb6, 0xfb, 0x2c, 0x61, 0xcf, 0x82, 0x55, 0x18, 0x44, 0x09, 0xde, 0x93,
+        0x3d, 0x70, 0xa7, 0xea, 0x3e, 0x73, 0xa4, 0xe9, 0x47, 0x0a, 0xdd, 0x90,
+        0xcc, 0x81, 0x56, 0x1b, 0xb5, 0xf8, 0x2f, 0x62, 0x97, 0xda, 0x0d, 0x40,
+        0xee, 0xa3, 0x74, 0x39, 0x65, 0x28, 0xff, 0xb2, 0x1c, 0x51, 0x86, 0xcb,
+        0x21, 0x6c, 0xbb, 0xf6, 0x58, 0x15, 0xc2, 0x8f, 0xd3, 0x9e, 0x49, 0x04,
+        0xaa, 0xe7, 0x30, 0x7d, 0x88, 0xc5, 0x12, 0x5f, 0xf1, 0xbc, 0x6b, 0x26,
+        0x7a, 0x37, 0xe0, 0xad, 0x03, 0x4e, 0x99, 0xd4, 0x7c, 0x31, 0xe6, 0xab,
+        0x05, 0x48, 0x9f, 0xd2, 0x8e, 0xc3, 0x14, 0x59, 0xf7, 0xba, 0x6d, 0x20,
+        0xd5, 0x98, 0x4f, 0x02, 0xac, 0xe1, 0x36, 0x7b, 0x27, 0x6a, 0xbd, 0xf0,
+        0x5e, 0x13, 0xc4, 0x89, 0x63, 0x2e, 0xf9, 0xb4, 0x1a, 0x57, 0x80, 0xcd,
+        0x91, 0xdc, 0x0b, 0x46, 0xe8, 0xa5, 0x72, 0x3f, 0xca, 0x87, 0x50, 0x1d,
+        0xb3, 0xfe, 0x29, 0x64, 0x38, 0x75, 0xa2, 0xef, 0x41, 0x0c, 0xdb, 0x96,
+        0x42, 0x0f, 0xd8, 0x95, 0x3b, 0x76, 0xa1, 0xec, 0xb0, 0xfd, 0x2a, 0x67,
+        0xc9, 0x84, 0x53, 0x1e, 0xeb, 0xa6, 0x71, 0x3c, 0x92, 0xdf, 0x08, 0x45,
+        0x19, 0x54, 0x83, 0xce, 0x60, 0x2d, 0xfa, 0xb7, 0x5d, 0x10, 0xc7, 0x8a,
+        0x24, 0x69, 0xbe, 0xf3, 0xaf, 0xe2, 0x35, 0x78, 0xd6, 0x9b, 0x4c, 0x01,
+        0xf4, 0xb9, 0x6e, 0x23, 0x8d, 0xc0, 0x17, 0x5a, 0x06, 0x4b, 0x9c, 0xd1,
+        0x7f, 0x32, 0xe5, 0xa8
+    };
+    
+    uint8_t CalCRC8(const uint8_t* data, uint16_t len) {
+        uint8_t crc = 0;
+        for (uint16_t i = 0; i < len; i++) {
+            crc = CrcTable[(crc ^ data[i]) & 0xff];
+        }
+        return crc;
+    }
+    
+    void readLoop() {
+        uint8_t byte;
+        while (!g_shutdown) {
+            if (::read(fd, &byte, 1) == 1) {
+                std::lock_guard<std::mutex> lock(queue_mutex);
+                buffer_queue.push(byte);
+            }
+        }
+    }
+    
+    bool processPacket() {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        
+        // Need at least a full packet
+        if (buffer_queue.size() < PACKET_SIZE) {
+            return false;
+        }
+        
+        // Look for header
+        while (buffer_queue.size() >= PACKET_SIZE) {
+            if (buffer_queue.front() == HEADER) {
+                // Check second byte
+                uint8_t packet[PACKET_SIZE];
+                
+                // Copy packet data
+                std::queue<uint8_t> temp_queue = buffer_queue;
+                for (int i = 0; i < PACKET_SIZE; i++) {
+                    packet[i] = temp_queue.front();
+                    temp_queue.pop();
+                }
+                
+                if (packet[1] == VERLEN) {
+                    // Verify CRC
+                    uint8_t crc = CalCRC8(packet, PACKET_SIZE - 1);
+                    if (crc == packet[PACKET_SIZE - 1]) {
+                        // Valid packet, remove from queue
+                        for (int i = 0; i < PACKET_SIZE; i++) {
+                            buffer_queue.pop();
+                        }
+                        
+                        // Parse packet
+                        parsePacket(packet);
+                        return true;
+                    }
+                }
+            }
+            
+            // Remove one byte and try again
+            buffer_queue.pop();
+        }
+        
+        return false;
+    }
+    
+    void parsePacket(const uint8_t* data) {
+        // Extract lidar speed (RPM)
+        uint16_t speed = (data[3] << 8) | data[2];
+        float rpm = speed / 360.0f;
+        
+        // Extract start angle
+        uint16_t start_angle = (data[5] << 8) | data[4];
+        float start_angle_deg = start_angle / 100.0f;
+        
+        // Extract end angle
+        uint16_t end_angle = (data[43] << 8) | data[42];
+        float end_angle_deg = end_angle / 100.0f;
+        
+        // Calculate angle step
+        float angle_diff = end_angle_deg - start_angle_deg;
+        if (angle_diff < 0) angle_diff += 360.0f;
+        float angle_step = angle_diff / (POINTS_PER_PACKET - 1);
+        
+        std::lock_guard<std::mutex> lock(lidar_data.mutex);
+        lidar_data.rpm = rpm;
+        lidar_data.valid = true;
+        
+        // Clear old data periodically
+        static auto last_clear = std::chrono::steady_clock::now();
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<float>(now - last_clear).count() > 1.0f) {
+            lidar_data.points.clear();
+            last_clear = now;
+        }
+        
+        // Parse distance data
+        for (int i = 0; i < POINTS_PER_PACKET; i++) {
+            int base_idx = 6 + i * 3;
+            uint16_t distance = (data[base_idx + 1] << 8) | data[base_idx];
+            uint8_t confidence = data[base_idx + 2];
+            
+            if (distance > 0 && confidence > 30) {  // Filter low confidence points
+                LidarPoint point;
+                point.angle = start_angle_deg + i * angle_step;
+                if (point.angle >= 360.0f) point.angle -= 360.0f;
+                point.distance = distance / 1000.0f;  // Convert mm to meters
+                point.confidence = confidence;
+                
+                lidar_data.points.push_back(point);
+            }
+        }
+    }
     
 public:
-    TFminiPlus(const char* device) {
+    FHL_LD19_Lidar(const char* device, LidarData& data) : lidar_data(data) {
         fd = open(device, O_RDWR | O_NOCTTY | O_SYNC);
         if (fd < 0) {
-            std::cerr << "Warning: Failed to open LIDAR UART " << device << std::endl;
+            std::cerr << "Warning: Failed to open LD19 LIDAR UART " << device << std::endl;
             return;
         }
         
@@ -443,72 +597,124 @@ public:
         if (tcgetattr(fd, &tty) != 0) {
             close(fd);
             fd = -1;
-            std::cerr << "Warning: Failed to get LIDAR UART attributes" << std::endl;
+            std::cerr << "Warning: Failed to get LD19 LIDAR UART attributes" << std::endl;
             return;
         }
         
-        cfsetospeed(&tty, B115200);
-        cfsetispeed(&tty, B115200);
+        // Configure for 230400 baud rate (LD19 default)
+        cfsetospeed(&tty, B230400);
+        cfsetispeed(&tty, B230400);
         
-        tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;
-        tty.c_iflag &= ~IGNBRK;
-        tty.c_lflag = 0;
-        tty.c_oflag = 0;
-        tty.c_cc[VMIN] = 0;
-        tty.c_cc[VTIME] = 5;
+        tty.c_cflag = (tty.c_cflag & ~CSIZE) | CS8;  // 8-bit chars
+        tty.c_iflag &= ~IGNBRK;                       // disable break processing
+        tty.c_lflag = 0;                              // no signaling chars, no echo
+        tty.c_oflag = 0;                              // no remapping, no delays
+        tty.c_cc[VMIN] = 0;                          // read doesn't block
+        tty.c_cc[VTIME] = 5;                         // 0.5 seconds read timeout
         
-        tty.c_iflag &= ~(IXON | IXOFF | IXANY);
-        tty.c_cflag |= (CLOCAL | CREAD);
-        tty.c_cflag &= ~(PARENB | PARODD);
+        tty.c_iflag &= ~(IXON | IXOFF | IXANY);      // shut off xon/xoff ctrl
+        tty.c_cflag |= (CLOCAL | CREAD);             // ignore modem controls
+        tty.c_cflag &= ~(PARENB | PARODD);           // shut off parity
         tty.c_cflag &= ~CSTOPB;
         tty.c_cflag &= ~CRTSCTS;
         
         if (tcsetattr(fd, TCSANOW, &tty) != 0) {
             close(fd);
             fd = -1;
-            std::cerr << "Warning: Failed to set LIDAR UART attributes" << std::endl;
+            std::cerr << "Warning: Failed to set LD19 LIDAR UART attributes" << std::endl;
+            return;
         }
+        
+        // Start the lidar
+        uint8_t start_cmd[] = {0x7C, 0x82, 0x05, 0x00, 0x01, 0xFF};
+        ::write(fd, start_cmd, sizeof(start_cmd));
+        
+        // Start read thread
+        read_thread = std::thread(&FHL_LD19_Lidar::readLoop, this);
+        
+        std::cout << "FHL-LD19 Lidar initialized on " << device << std::endl;
     }
     
-    ~TFminiPlus() {
-        if (fd >= 0) close(fd);
+    ~FHL_LD19_Lidar() {
+        g_shutdown = true;
+        if (read_thread.joinable()) {
+            read_thread.join();
+        }
+        if (fd >= 0) {
+            // Stop the lidar
+            uint8_t stop_cmd[] = {0x7C, 0x82, 0x05, 0x00, 0x00, 0xFF};
+            ::write(fd, stop_cmd, sizeof(stop_cmd));
+            close(fd);
+        }
     }
     
     bool isConnected() const { return fd >= 0; }
     
-    bool read(LidarData& data) {
-        if (fd < 0) {
-            data.distance = 10.0f;  // Safe default
-            data.valid = false;
-            return false;
+    void process() {
+        while (processPacket()) {
+            // Process all available packets
         }
+    }
+    
+    // Get distance at specific angle
+    float getDistanceAtAngle(float angle) {
+        std::lock_guard<std::mutex> lock(lidar_data.mutex);
         
-        uint8_t buffer[9];
-        int n = ::read(fd, buffer, 9);
+        float min_distance = 10.0f;
+        float angle_tolerance = 5.0f;  // ±5 degrees
         
-        if (n == 9 && buffer[0] == FRAME_HEADER && buffer[1] == FRAME_HEADER) {
-            uint16_t distance = buffer[2] | (buffer[3] << 8);
-            uint16_t strength = buffer[4] | (buffer[5] << 8);
+        for (const auto& point : lidar_data.points) {
+            float angle_diff = std::abs(point.angle - angle);
+            if (angle_diff > 180.0f) angle_diff = 360.0f - angle_diff;
             
-            uint8_t checksum = 0;
-            for (int i = 0; i < 8; i++) {
-                checksum += buffer[i];
-            }
-            
-            if (checksum == buffer[8]) {
-                data.distance = distance / 100.0f;  // Convert to meters
-                data.strength = strength;
-                data.valid = true;
-                return true;
+            if (angle_diff <= angle_tolerance) {
+                min_distance = std::min(min_distance, point.distance);
             }
         }
         
-        data.valid = false;
-        return false;
+        return min_distance;
+    }
+    
+    // Get minimum distance in angle range
+    float getMinDistanceInRange(float start_angle, float end_angle) {
+        std::lock_guard<std::mutex> lock(lidar_data.mutex);
+        
+        float min_distance = 10.0f;
+        
+        for (const auto& point : lidar_data.points) {
+            bool in_range = false;
+            
+            if (start_angle <= end_angle) {
+                in_range = (point.angle >= start_angle && point.angle <= end_angle);
+            } else {
+                // Handle wrap around 360 degrees
+                in_range = (point.angle >= start_angle || point.angle <= end_angle);
+            }
+            
+            if (in_range) {
+                min_distance = std::min(min_distance, point.distance);
+            }
+        }
+        
+        return min_distance;
+    }
+    
+    // Get full 360° scan data
+    std::vector<float> get360Scan() {
+        std::lock_guard<std::mutex> lock(lidar_data.mutex);
+        
+        std::vector<float> scan(360, 10.0f);  // Initialize with max range
+        
+        for (const auto& point : lidar_data.points) {
+            int angle_idx = static_cast<int>(point.angle) % 360;
+            scan[angle_idx] = std::min(scan[angle_idx], point.distance);
+        }
+        
+        return scan;
     }
 };
 
-// GPS NMEA Parser
+// GPS Parser for GEPRC GEP-M10
 class GPSParser {
 private:
     int fd = -1;
@@ -598,7 +804,7 @@ public:
         char c;
         while (::read(fd, &c, 1) == 1) {
             if (c == '\n') {
-                if (buffer.find("$GPGGA") == 0) {
+                if (buffer.find("$GPGGA") == 0 || buffer.find("$GNGGA") == 0) {
                     parseGGA(buffer, data);
                 }
                 buffer.clear();
@@ -775,11 +981,31 @@ public:
 // Main Flight Controller Class
 class FlightController {
 private:
+    // Enhanced obstacle avoidance
+    struct ObstacleVector {
+        float x = 0;
+        float y = 0;
+        float magnitude = 0;
+    };
+    ObstacleVector repulsion_vector;
+    float safe_directions[360];  // Safety score for each direction
+    float obstacle_map[360];     // Distance map from LD19
+    
+    // Precision landing
+    bool precision_landing_active = false;
+    float ground_level = 0.0f;
+    float landing_target_x = 0.0f;
+    float landing_target_y = 0.0f;
+    float descent_rate = 0.5f;  // m/s
+    float position_hold_radius = 0.1f;  // meters
+    float touchdown_altitude = 0.05f;  // 5cm
+    int ground_contact_count = 0;
+
     // Sensors
     std::unique_ptr<MPU6050> mpu6050;
     std::unique_ptr<QMC5883L> magnetometer;
     std::unique_ptr<DPS310> barometer;
-    std::unique_ptr<TFminiPlus> lidar;
+    std::unique_ptr<FHL_LD19_Lidar> lidar;
     std::unique_ptr<GPSParser> gps;
     std::unique_ptr<PWMOutput> motors;
     std::unique_ptr<MahonyAHRS> ahrs;
@@ -796,13 +1022,7 @@ private:
     PIDController yaw_pid{4.5f, 1.0f, 0.0f, 50.0f, 500.0f};
     PIDController altitude_pid{5.0f, 1.0f, 2.0f, 100.0f, 500.0f};
     
-    // Enhanced obstacle avoidance with scanning
-    float obstacle_distance = 10.0f;
-    bool obstacle_detected = false;
-    float obstacle_map[360] = {10.0f};  // 360 degree obstacle map
-    int scan_angle = 0;
-    bool scanning_enabled = false;
-    float last_scan_time = 0;
+    // Obstacle detection
     float min_obstacle_distance = 10.0f;
     int min_obstacle_angle = 0;
     
@@ -825,7 +1045,7 @@ private:
     bool has_lidar = false;
     bool has_gps = false;
     
-    void updateIMU() {
+void updateIMU() {
         if (mpu6050 && mpu6050->isConnected()) {
             float temp;
             mpu6050->read(imu_data.ax, imu_data.ay, imu_data.az,
@@ -858,6 +1078,232 @@ private:
             state.pitch = std::max(-PI/2, std::min(PI/2, state.pitch));
         }
     }
+
+    // Calculate repulsion vector from all obstacles
+    void calculateRepulsionVector() {
+        repulsion_vector.x = 0;
+        repulsion_vector.y = 0;
+        
+        // Check all directions
+        for (int angle = 0; angle < 360; angle += 5) {  // Check every 5 degrees
+            float distance = obstacle_map[angle];
+            
+            if (distance < 3.0f) {  // Consider obstacles within 3 meters
+                // Calculate repulsion force (inverse square law)
+                float force = 1.0f / (distance * distance + 0.1f);  // +0.1 to avoid division by zero
+                
+                // Convert to cartesian coordinates
+                float rad = angle * DEG_TO_RAD;
+                repulsion_vector.x += force * std::cos(rad);
+                repulsion_vector.y += force * std::sin(rad);
+            }
+        }
+        
+        // Calculate magnitude
+        repulsion_vector.magnitude = std::sqrt(repulsion_vector.x * repulsion_vector.x + 
+                                              repulsion_vector.y * repulsion_vector.y);
+        
+        // Normalize if needed
+        if (repulsion_vector.magnitude > 0) {
+            repulsion_vector.x /= repulsion_vector.magnitude;
+            repulsion_vector.y /= repulsion_vector.magnitude;
+        }
+    }
+
+    // Find the safest direction to move
+    float findSafestDirection() {
+        // Calculate safety score for each direction
+        for (int angle = 0; angle < 360; angle++) {
+            safe_directions[angle] = 10.0f;  // Start with max safety
+            
+            // Check a cone of ±30 degrees around this direction
+            for (int check = -30; check <= 30; check += 5) {
+                int check_angle = (angle + check + 360) % 360;
+                float distance = obstacle_map[check_angle];
+                
+                // Reduce safety based on proximity
+                float weight = 1.0f - std::abs(check) / 30.0f;  // Center weighted
+                safe_directions[angle] = std::min(safe_directions[angle], distance * weight);
+            }
+        }
+        
+        // Find direction with highest safety score
+        float max_safety = 0;
+        int safest_angle = 0;
+        
+        for (int angle = 0; angle < 360; angle++) {
+            if (safe_directions[angle] > max_safety) {
+                max_safety = safe_directions[angle];
+                safest_angle = angle;
+            }
+        }
+        
+        return safest_angle;
+    }
+
+    // Execute precision landing with ground detection
+    void executePrecisionLanding(float dt) {
+        // Get ground distance from LD19 looking down
+        float ground_distance = lidar->getDistanceAtAngle(180);  // Assuming 180° is down
+        
+        if (ground_distance < 10.0f) {  // Valid ground reading
+            // Update ground level estimate
+            ground_level = state.z - ground_distance;
+            
+            // Phase 2: Position hold while descending
+            float position_error_x = landing_target_x - state.x;
+            float position_error_y = landing_target_y - state.y;
+            float position_error = std::sqrt(position_error_x * position_error_x + 
+                                           position_error_y * position_error_y);
+            
+            // Correct position if drifting
+            if (position_error > position_hold_radius) {
+                target_roll = position_error_y * 0.5f;  // Proportional control
+                target_pitch = position_error_x * 0.5f;
+                
+                // Limit corrections
+                target_roll = std::max(-0.1f, std::min(0.1f, target_roll));
+                target_pitch = std::max(-0.1f, std::min(0.1f, target_pitch));
+            } else {
+                target_roll = 0;
+                target_pitch = 0;
+            }
+            
+            // Phase 3: Controlled descent
+            float altitude_above_ground = ground_distance;
+            
+            if (altitude_above_ground > 2.0f) {
+                // High altitude - normal descent
+                descent_rate = 0.5f;
+            } else if (altitude_above_ground > 0.5f) {
+                // Medium altitude - slow down
+                descent_rate = 0.3f;
+            } else if (altitude_above_ground > touchdown_altitude) {
+                // Final approach - very slow
+                descent_rate = 0.1f;
+            } else {
+                // Touchdown detected
+                descent_rate = 0.0f;
+                ground_contact_count++;
+                
+                if (ground_contact_count > 10) {  // Confirm ground contact
+                    std::cout << "*** TOUCHDOWN CONFIRMED ***" << std::endl;
+                    std::cout << "Landing position error: " << position_error << "m" << std::endl;
+                    precision_landing_active = false;
+                    target_throttle = PWM_MIN;
+                    
+                    // Auto-disarm after 2 seconds
+                    std::thread([this]() {
+                        std::this_thread::sleep_for(std::chrono::seconds(2));
+                        disarm();
+                    }).detach();
+                }
+            }
+            
+            // Update altitude target
+            target_altitude -= descent_rate * dt;
+            target_altitude = std::max(ground_level, target_altitude);
+            
+            // Adjust throttle for descent
+            if (altitude_above_ground < 0.5f) {
+                // Very low - reduce throttle
+                target_throttle = 1200 + (altitude_above_ground * 600);
+            } else {
+                target_throttle = 1400;  // Normal hover throttle
+            }
+            
+            // Status output
+            static int status_counter = 0;
+            if (++status_counter % 20 == 0) {
+                std::cout << "Precision Landing: Alt=" << altitude_above_ground 
+                         << "m Pos_err=" << position_error 
+                         << "m Descent=" << descent_rate << "m/s" << std::endl;
+            }
+        } else {
+            std::cout << "WARNING: No LIDAR ground data for precision landing!" << std::endl;
+        }
+    }
+
+    // Emergency obstacle response
+    void emergencyObstacleResponse() {
+        // Find closest obstacle
+        float min_dist = 10.0f;
+        int min_angle = 0;
+        
+        for (int i = 0; i < 360; i++) {
+            if (obstacle_map[i] < min_dist) {
+                min_dist = obstacle_map[i];
+                min_angle = i;
+            }
+        }
+        
+        if (min_dist < CRITICAL_OBSTACLE_THRESHOLD) {  // Critical distance
+            std::cout << "\n*** EMERGENCY OBSTACLE AVOIDANCE ***" << std::endl;
+            std::cout << "Critical obstacle at " << min_angle << "° distance " << min_dist << "m" << std::endl;
+            
+            // Emergency stop
+            target_roll = 0;
+            target_pitch = 0;
+            target_yaw_rate = 0;
+            
+            // Move away from obstacle
+            float escape_angle = (min_angle + 180) % 360;
+            float escape_rad = escape_angle * DEG_TO_RAD;
+            
+            target_pitch = 0.3f * std::cos(escape_rad);
+            target_roll = 0.3f * std::sin(escape_rad);
+            
+            // Increase altitude if possible
+            if (state.z < 10.0f) {
+                target_altitude = state.z + 1.0f;
+            }
+        }
+    }
+
+    // Print 360° obstacle status
+    void print360ObstacleStatus() {
+        std::cout << "\n=== 360° Obstacle Analysis (FHL-LD19) ===" << std::endl;
+        
+        // Find obstacles in each quadrant
+        struct Quadrant {
+            std::string name;
+            int start_angle;
+            int end_angle;
+            float min_distance;
+            int obstacle_count;
+        };
+        
+        Quadrant quadrants[4] = {
+            {"Front", 315, 45, 10.0f, 0},
+            {"Right", 45, 135, 10.0f, 0},
+            {"Back", 135, 225, 10.0f, 0},
+            {"Left", 225, 315, 10.0f, 0}
+        };
+        
+        // Analyze each quadrant
+        for (auto& quad : quadrants) {
+            for (int angle = quad.start_angle; angle != quad.end_angle; angle = (angle + 1) % 360) {
+                if (obstacle_map[angle] < 3.0f) {
+                    quad.obstacle_count++;
+                    quad.min_distance = std::min(quad.min_distance, obstacle_map[angle]);
+                }
+            }
+            
+            std::cout << quad.name << ": ";
+            if (quad.obstacle_count > 0) {
+                std::cout << quad.obstacle_count << " obstacles, closest at " 
+                         << quad.min_distance << "m";
+            } else {
+                std::cout << "Clear";
+            }
+            std::cout << std::endl;
+        }
+        
+        std::cout << "Safest direction: " << findSafestDirection() << "°" << std::endl;
+        std::cout << "Repulsion vector: X=" << repulsion_vector.x 
+                 << " Y=" << repulsion_vector.y 
+                 << " Magnitude=" << repulsion_vector.magnitude << std::endl;
+    }
     
     void sensorLoop() {
         auto last_time = std::chrono::steady_clock::now();
@@ -881,48 +1327,34 @@ private:
                     barometer->read(imu_data.pressure, imu_data.temperature, imu_data.altitude);
                 }
                 
-                // Lidar with scanning
+                // FHL-LD19 Lidar processing
                 if (lidar && lidar->isConnected()) {
-                    lidar->read(lidar_data);
-                    if (lidar_data.valid) {
-                        // Update obstacle map at current yaw angle
-                        int map_index = ((int)(state.yaw * RAD_TO_DEG + 360)) % 360;
-                        obstacle_map[map_index] = lidar_data.distance;
-                        
-                        // If scanning mode is enabled, rotate slowly
-                        if (scanning_enabled && state.armed && !state.in_flight) {
-                            auto current_time = std::chrono::steady_clock::now().time_since_epoch().count() / 1e9;
-                            if (current_time - last_scan_time > 0.1f) {  // Scan every 100ms
-                                target_yaw_rate = 30.0f * DEG_TO_RAD;  // 30 deg/s scan rate
-                                last_scan_time = current_time;
-                            }
-                        }
-                        
-                        // Find minimum obstacle distance in front 90 degree arc
-                        min_obstacle_distance = 10.0f;
-                        for (int i = -45; i <= 45; i++) {
-                            int idx = (map_index + i + 360) % 360;
-                            if (obstacle_map[idx] < min_obstacle_distance) {
-                                min_obstacle_distance = obstacle_map[idx];
-                                min_obstacle_angle = i;
-                            }
-                        }
-                        
-                        obstacle_distance = min_obstacle_distance;
-                        obstacle_detected = (obstacle_distance < OBSTACLE_THRESHOLD);
-                        
-                        // Decay old measurements
-                        for (int i = 0; i < 360; i++) {
-                            if (i != map_index && obstacle_map[i] < 10.0f) {
-                                obstacle_map[i] += 0.01f;  // Slowly forget old measurements
-                                if (obstacle_map[i] > 10.0f) obstacle_map[i] = 10.0f;
-                            }
-                        }
+                    lidar->process();  // Process incoming packets
+                    
+                    // Get 360° scan data
+                    auto scan_data = lidar->get360Scan();
+                    
+                    // Update obstacle map
+                    for (int i = 0; i < 360; i++) {
+                        obstacle_map[i] = scan_data[i];
                     }
-                } else {
-                    // Safe default
-                    obstacle_distance = 10.0f;
-                    obstacle_detected = false;
+                    
+                    // Find minimum obstacle distance in front 90 degree arc
+                    min_obstacle_distance = lidar->getMinDistanceInRange(315, 45);
+                    
+                    // Check critical zones
+                    float front_dist = lidar->getMinDistanceInRange(350, 10);
+                    float right_dist = lidar->getMinDistanceInRange(80, 100);
+                    float back_dist = lidar->getMinDistanceInRange(170, 190);
+                    float left_dist = lidar->getMinDistanceInRange(260, 280);
+                    
+                    // Trigger emergency response if needed
+                    if (front_dist < CRITICAL_OBSTACLE_THRESHOLD || 
+                        right_dist < CRITICAL_OBSTACLE_THRESHOLD ||
+                        back_dist < CRITICAL_OBSTACLE_THRESHOLD ||
+                        left_dist < CRITICAL_OBSTACLE_THRESHOLD) {
+                        emergencyObstacleResponse();
+                    }
                 }
                 
                 // GPS
@@ -957,49 +1389,51 @@ private:
             std::lock_guard<std::mutex> lock(state_mutex);
             
             if (state.armed) {
-                // ENHANCED OBSTACLE AVOIDANCE WITH DIRECTIONAL RESPONSE
-                float pitch_override = 0.0f;
-                float roll_override = 0.0f;
+                // ENHANCED 360° OBSTACLE AVOIDANCE with FHL-LD19
+                calculateRepulsionVector();
+                float safe_dir = findSafestDirection();
                 
-                if (obstacle_detected) {
-                    // Emergency response based on obstacle direction
-                    if (min_obstacle_angle < -20) {
-                        // Obstacle to the left - move right
-                        roll_override = 10.0f * DEG_TO_RAD;
-                        std::cout << "\n*** OBSTACLE LEFT! Distance: " << obstacle_distance 
-                                 << "m - Moving RIGHT! ***\n" << std::endl;
-                    } else if (min_obstacle_angle > 20) {
-                        // Obstacle to the right - move left
-                        roll_override = -10.0f * DEG_TO_RAD;
-                        std::cout << "\n*** OBSTACLE RIGHT! Distance: " << obstacle_distance 
-                                 << "m - Moving LEFT! ***\n" << std::endl;
-                    } else {
-                        // Obstacle straight ahead - move back
-                        pitch_override = -15.0f * DEG_TO_RAD;
-                        std::cout << "\n*** OBSTACLE AHEAD! Distance: " << obstacle_distance 
-                                 << "m - Moving BACK! ***\n" << std::endl;
+                float pitch_avoid = 0.0f;
+                float roll_avoid = 0.0f;
+                
+                if (repulsion_vector.magnitude > 0.1f) {
+                    // Apply repulsion vector
+                    pitch_avoid = -repulsion_vector.y * 0.2f;  // Scale factor
+                    roll_avoid = -repulsion_vector.x * 0.2f;
+                    
+                    // If current direction is unsafe, rotate towards safest direction
+                    float current_heading = std::atan2(target_pitch, target_roll) * RAD_TO_DEG;
+                    float heading_diff = safe_dir - current_heading;
+                    
+                    // Normalize angle difference
+                    while (heading_diff > 180) heading_diff -= 360;
+                    while (heading_diff < -180) heading_diff += 360;
+                    
+                    if (std::abs(heading_diff) > 45) {
+                        target_yaw_rate = heading_diff > 0 ? 30.0f * DEG_TO_RAD : -30.0f * DEG_TO_RAD;
                     }
+                    
+                    std::cout << "\n*** 360° OBSTACLE AVOIDANCE ACTIVE (FHL-LD19) ***" << std::endl;
+                    std::cout << "Repulsion vector: X=" << repulsion_vector.x 
+                             << " Y=" << repulsion_vector.y 
+                             << " Safest direction: " << safe_dir << "°" << std::endl;
                 }
                 
-                // Check if we should avoid based on movement direction
-                bool should_avoid = false;
-                if (target_pitch > 0 && min_obstacle_angle >= -45 && min_obstacle_angle <= 45) {
-                    should_avoid = true;  // Moving forward into obstacle
-                } else if (target_roll > 0 && min_obstacle_angle > 0) {
-                    should_avoid = true;  // Moving right into obstacle
-                } else if (target_roll < 0 && min_obstacle_angle < 0) {
-                    should_avoid = true;  // Moving left into obstacle
-                }
+                // Apply avoidance to targets
+                float effective_roll = target_roll + roll_avoid;
+                float effective_pitch = target_pitch + pitch_avoid;
                 
-                // Apply avoidance if needed
-                if (obstacle_detected && should_avoid) {
-                    target_pitch += pitch_override;
-                    target_roll += roll_override;
+                // PRECISION LANDING MODE
+                if (precision_landing_active) {
+                    executePrecisionLanding(dt);
+                    // Landing overrides normal control
+                    effective_roll = target_roll;
+                    effective_pitch = target_pitch;
                 }
                 
                 // Calculate control errors
-                float roll_error = target_roll - state.roll;
-                float pitch_error = target_pitch - state.pitch;
+                float roll_error = effective_roll - state.roll;
+                float pitch_error = effective_pitch - state.pitch;
                 float yaw_rate_error = target_yaw_rate - imu_data.gz;
                 float altitude_error = target_altitude - state.z;
                 
@@ -1012,9 +1446,9 @@ private:
                 // Mix outputs for quadcopter X configuration
                 float base_throttle = target_throttle + altitude_output;
                 
-                // OBSTACLE AVOIDANCE THROTTLE REDUCTION
-                if (obstacle_detected) {
-                    base_throttle *= 0.7f;  // Reduce throttle when avoiding
+                // Reduce throttle near obstacles
+                if (repulsion_vector.magnitude > 0.5f) {
+                    base_throttle *= (1.0f - 0.3f * std::min(1.0f, repulsion_vector.magnitude));
                 }
                 
                 int m1 = base_throttle + roll_output - pitch_output + yaw_output;
@@ -1036,16 +1470,16 @@ private:
                 motors->disarm();
             }
             
-            std::this_thread::sleep_for(std::chrono::milliseconds(5)); // 200Hz control loop
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         }
     }
     
 public:
     FlightController() : state{} {
-        std::cout << "Initializing Flight Controller..." << std::endl;
+        std::cout << "Initializing Flight Controller with FHL-LD19 Lidar..." << std::endl;
         
         try {
-            // Initialize sensors (continue even if some fail)
+            // Initialize sensors
             try {
                 mpu6050 = std::make_unique<MPU6050>("/dev/i2c-1");
                 has_imu = mpu6050->isConnected();
@@ -1058,7 +1492,7 @@ public:
             try {
                 magnetometer = std::make_unique<QMC5883L>("/dev/i2c-1");
                 has_mag = magnetometer->isConnected();
-                if (has_mag) std::cout << "✓ QMC5883L Magnetometer initialized" << std::endl;
+                if (has_mag) std::cout << "✓ QMC5883L Magnetometer (GEPRC GEP-M10) initialized" << std::endl;
                 else std::cout << "✗ QMC5883L Magnetometer not found" << std::endl;
             } catch (...) {
                 std::cout << "✗ QMC5883L Magnetometer initialization failed" << std::endl;
@@ -1067,28 +1501,33 @@ public:
             try {
                 barometer = std::make_unique<DPS310>("/dev/i2c-1");
                 has_baro = barometer->isConnected();
-                if (has_baro) std::cout << "✓ DPS310 Barometer initialized" << std::endl;
+                if (has_baro) std::cout << "✓ DPS310 Barometer (GEPRC GEP-M10) initialized" << std::endl;
                 else std::cout << "✗ DPS310 Barometer not found" << std::endl;
             } catch (...) {
                 std::cout << "✗ DPS310 Barometer initialization failed" << std::endl;
             }
             
             try {
-                lidar = std::make_unique<TFminiPlus>("/dev/ttyUSB0");
+                lidar = std::make_unique<FHL_LD19_Lidar>("/dev/ttyUSB0", lidar_data);
                 has_lidar = lidar->isConnected();
-                if (has_lidar) std::cout << "✓ TFmini Plus Lidar initialized" << std::endl;
-                else std::cout << "✗ TFmini Plus Lidar not found on /dev/ttyUSB0" << std::endl;
+                if (has_lidar) std::cout << "✓ FHL-LD19 360° Lidar initialized" << std::endl;
+                else std::cout << "✗ FHL-LD19 Lidar not found on /dev/ttyUSB0" << std::endl;
             } catch (...) {
-                std::cout << "✗ TFmini Plus Lidar initialization failed" << std::endl;
+                std::cout << "✗ FHL-LD19 Lidar initialization failed" << std::endl;
             }
             
             try {
                 gps = std::make_unique<GPSParser>("/dev/ttyUSB1");
                 has_gps = gps->isConnected();
-                if (has_gps) std::cout << "✓ GPS initialized" << std::endl;
+                if (has_gps) std::cout << "✓ GEPRC GEP-M10 GPS initialized" << std::endl;
                 else std::cout << "✗ GPS not found on /dev/ttyUSB1" << std::endl;
             } catch (...) {
                 std::cout << "✗ GPS initialization failed" << std::endl;
+            }
+            
+            // Initialize obstacle map
+            for (int i = 0; i < 360; i++) {
+                obstacle_map[i] = 10.0f;  // Max range
             }
             
             // Always initialize motors and AHRS
@@ -1105,7 +1544,12 @@ public:
             
             if (!has_imu) {
                 std::cout << "\nWARNING: No IMU detected - flying will be unstable!" << std::endl;
-                std::cout << "Please connect an MPU6050 to I2C address 0x68" << std::endl;
+            }
+            
+            if (has_lidar) {
+                std::cout << "\nFHL-LD19 360° Obstacle Detection ACTIVE" << std::endl;
+                std::cout << "Obstacle threshold: " << OBSTACLE_THRESHOLD << "m" << std::endl;
+                std::cout << "Critical threshold: " << CRITICAL_OBSTACLE_THRESHOLD << "m" << std::endl;
             }
             
         } catch (const std::exception& e) {
@@ -1144,8 +1588,8 @@ public:
             std::cout << "*** ARMED ***" << std::endl;
             
             if (has_lidar) {
-                std::cout << "Obstacle avoidance ACTIVE - threshold: " << OBSTACLE_THRESHOLD << "m" << std::endl;
-                std::cout << "Type 'scan' to enable 360° environment scanning" << std::endl;
+                std::cout << "FHL-LD19 360° obstacle avoidance ACTIVE" << std::endl;
+                std::cout << "Lidar RPM: " << lidar_data.rpm << std::endl;
             } else {
                 std::cout << "WARNING: No LIDAR - obstacle avoidance DISABLED!" << std::endl;
             }
@@ -1158,6 +1602,7 @@ public:
         std::lock_guard<std::mutex> lock(state_mutex);
         state.armed = false;
         state.in_flight = false;
+        precision_landing_active = false;
         target_throttle = 0;
         std::cout << "*** DISARMED ***" << std::endl;
     }
@@ -1174,28 +1619,51 @@ public:
     }
     
     void land() {
-        target_altitude = 0;
-        target_throttle = 1200;  // Slow descent
-        std::cout << "Landing..." << std::endl;
-        
-        // Auto-disarm when landed
-        std::thread([this]() {
-            while (state.z > 0.1f && state.armed) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            if (state.armed && state.z <= 0.1f) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                disarm();
-            }
-        }).detach();
+        if (!has_lidar) {
+            // Fallback to simple landing
+            std::cout << "No LIDAR - using simple landing mode" << std::endl;
+            target_altitude = 0;
+            target_throttle = 1200;
+            
+            std::thread([this]() {
+                while (state.z > 0.1f && state.armed) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+                if (state.armed && state.z <= 0.1f) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                    disarm();
+                }
+            }).detach();
+        } else {
+            // Precision landing with ground detection
+            std::cout << "*** PRECISION LANDING ENGAGED (FHL-LD19) ***" << std::endl;
+            precision_landing_active = true;
+            ground_contact_count = 0;
+            
+            // Save current position as landing target
+            landing_target_x = state.x;
+            landing_target_y = state.y;
+            
+            // Start descent
+            descent_rate = 0.5f;
+        }
     }
     
     void move(float forward_m, float right_m, float up_m) {
-        // Check obstacle before allowing forward movement
-        if (forward_m > 0 && obstacle_detected) {
-            std::cout << "WARNING: Obstacle detected at " << obstacle_distance 
-                     << "m - forward movement blocked!" << std::endl;
-            return;
+        // Check obstacles before movement
+        if (forward_m > 0) {
+            float front_dist = lidar->getMinDistanceInRange(350, 10);
+            if (front_dist < OBSTACLE_THRESHOLD) {
+                std::cout << "WARNING: Obstacle ahead at " << front_dist << "m - forward movement blocked!" << std::endl;
+                return;
+            }
+        }
+        if (right_m > 0) {
+            float right_dist = lidar->getMinDistanceInRange(80, 100);
+            if (right_dist < OBSTACLE_THRESHOLD) {
+                std::cout << "WARNING: Obstacle on right at " << right_dist << "m - right movement blocked!" << std::endl;
+                return;
+            }
         }
         
         // Convert to roll/pitch commands
@@ -1224,40 +1692,26 @@ public:
         std::cout << "Hovering" << std::endl;
     }
     
-    void enableScanning(bool enable) {
-        scanning_enabled = enable;
-        if (enable) {
-            std::cout << "Obstacle scanning ENABLED - drone will rotate to map surroundings" << std::endl;
-        } else {
-            std::cout << "Obstacle scanning DISABLED" << std::endl;
-            target_yaw_rate = 0;
-        }
-    }
-    
-    void printObstacleMap() {
-        std::cout << "\n=== Obstacle Map (360°) ===" << std::endl;
-        std::cout << "Direction: N=0° E=90° S=180° W=270°" << std::endl;
-        
-        // Print compass rose
-        for (int angle = 0; angle < 360; angle += 30) {
-            float dist = obstacle_map[angle];
-            std::string indicator = (dist < OBSTACLE_THRESHOLD) ? "!" : 
-                                   (dist < 2.0f) ? "*" : 
-                                   (dist < 5.0f) ? "." : " ";
-            std::cout << angle << "°: " << std::fixed << std::setprecision(1) 
-                     << dist << "m " << indicator << "  ";
-            if ((angle + 30) % 90 == 0) std::cout << std::endl;
+    void scanEnvironment() {
+        if (!has_lidar) {
+            std::cout << "No LIDAR available for scanning" << std::endl;
+            return;
         }
         
-        std::cout << "\nClosest obstacle: " << min_obstacle_distance << "m at " 
-                 << min_obstacle_angle << "° relative" << std::endl;
-    }
-    
-    void clearObstacleMap() {
-        for (int i = 0; i < 360; i++) {
-            obstacle_map[i] = 10.0f;
+        std::cout << "Performing 360° environment scan..." << std::endl;
+        
+        // Rotate slowly while scanning
+        float original_yaw = state.yaw;
+        target_yaw_rate = 30.0f * DEG_TO_RAD;  // 30 deg/s
+        
+        auto start_time = std::chrono::steady_clock::now();
+        while (std::chrono::duration<float>(std::chrono::steady_clock::now() - start_time).count() < 12.0f) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        std::cout << "Obstacle map cleared" << std::endl;
+        
+        target_yaw_rate = 0;
+        std::cout << "Scan complete!" << std::endl;
+        print360ObstacleStatus();
     }
     
     void flyToGPS(double lat, double lon, float alt) {
@@ -1318,9 +1772,12 @@ public:
         }
         
         if (has_lidar) {
-            std::cout << "Lidar: " << min_obstacle_distance << "m @ " << min_obstacle_angle << "°" 
-                     << (obstacle_detected ? " [*** OBSTACLE! ***]" : "") << std::endl;
-            std::cout << "Scanning: " << (scanning_enabled ? "ACTIVE" : "Disabled") << std::endl;
+            std::cout << "FHL-LD19 Lidar: RPM=" << lidar_data.rpm << std::endl;
+            std::cout << "  Front: " << lidar->getMinDistanceInRange(350, 10) << "m" << std::endl;
+            std::cout << "  Right: " << lidar->getMinDistanceInRange(80, 100) << "m" << std::endl;
+            std::cout << "  Back: " << lidar->getMinDistanceInRange(170, 190) << "m" << std::endl;
+            std::cout << "  Left: " << lidar->getMinDistanceInRange(260, 280) << "m" << std::endl;
+            std::cout << "  Min distance: " << min_obstacle_distance << "m" << std::endl;
         } else {
             std::cout << "Lidar: NOT CONNECTED" << std::endl;
         }
@@ -1340,15 +1797,17 @@ private:
         std::cout << "arm        - Arm motors" << std::endl;
         std::cout << "disarm     - Disarm motors" << std::endl;
         std::cout << "takeoff H  - Take off to H meters" << std::endl;
-        std::cout << "land       - Land drone" << std::endl;
+        std::cout << "land       - Precision land with FHL-LD19" << std::endl;
         std::cout << "move F R U - Move Forward/Right/Up (meters)" << std::endl;
         std::cout << "rotate D   - Rotate D degrees/sec" << std::endl;
         std::cout << "hover      - Hold position" << std::endl;
+        std::cout << "scan       - Perform 360° environment scan" << std::endl;
+        std::cout << "obstacles  - Show 360° obstacle analysis" << std::endl;
         std::cout << "goto LAT LON ALT - Fly to GPS coordinate" << std::endl;
         std::cout << "status     - Show drone status" << std::endl;
         std::cout << "help       - Show this help" << std::endl;
         std::cout << "quit       - Exit program" << std::endl;
-        std::cout << "\nOBSTACLE AVOIDANCE is automatic when armed!" << std::endl;
+        std::cout << "\nFHL-LD19 360° OBSTACLE AVOIDANCE is automatic when armed!" << std::endl;
     }
     
 public:
@@ -1393,13 +1852,9 @@ public:
             } else if (cmd == "hover") {
                 fc.hover();
             } else if (cmd == "scan") {
-                fc.enableScanning(true);
-            } else if (cmd == "stopscan") {
-                fc.enableScanning(false);
-            } else if (cmd == "map") {
-                fc.printObstacleMap();
-            } else if (cmd == "clearmap") {
-                fc.clearObstacleMap();
+                fc.scanEnvironment();
+            } else if (cmd == "obstacles") {
+                fc.print360ObstacleStatus();
             } else if (cmd == "goto") {
                 double lat, lon;
                 float alt;
@@ -1434,10 +1889,11 @@ int main() {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
     
-    std::cout << "==================================" << std::endl;
-    std::cout << "   DRONE FLIGHT CONTROL SYSTEM    " << std::endl;
-    std::cout << "==================================" << std::endl;
-    std::cout << "Version 1.0 - With Obstacle Avoidance" << std::endl;
+    std::cout << "==========================================" << std::endl;
+    std::cout << "   DRONE FLIGHT CONTROL SYSTEM v2.0      " << std::endl;
+    std::cout << "==========================================" << std::endl;
+    std::cout << "FHL-LD19 360° Lidar Obstacle Avoidance" << std::endl;
+    std::cout << "GEPRC GEP-M10 GPS/MAG/BARO Module" << std::endl;
     std::cout << "\nInitializing..." << std::endl;
     
     try {
