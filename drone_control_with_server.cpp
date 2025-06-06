@@ -1,5 +1,5 @@
 // drone_control.cpp - FHL-LD19 LIDAR COMPATIBLE DRONE FLIGHT CONTROL SYSTEM
-// Compile: g++ -std=c++17 -O2 -o drone_control drone_control.cpp -lpthread -lrt -lnlohmann_json
+// Compile: g++ -std=c++17 -O2 -o drone_control drone_control_with_server.cpp -lpthread -lrt -lnlohmann_json
 // Run: sudo ./drone_control
 
 #include <iostream>
@@ -23,7 +23,7 @@
 #include <queue>
 
 #include "drone_server.hpp"
-#include <nlohmann/json.hpp>
+#include "nlohmann/json.hpp"
 
 // Constants
 constexpr float PI = 3.14159265359f;

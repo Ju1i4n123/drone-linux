@@ -10,7 +10,9 @@
 #include <queue>
 #include <chrono>
 #include <sstream>
-#include <nlohmann/json.hpp>
+#include <cstdlib>  // Added for rand() and srand()
+#include <ctime>    // Added for time()
+#include "nlohmann/json.hpp"
 
 // Simple HTTP server implementation
 #include <sys/socket.h>
@@ -77,7 +79,10 @@ private:
             if (colon != std::string::npos) {
                 std::string key = line.substr(0, colon);
                 std::string value = line.substr(colon + 2);
-                value.pop_back(); // Remove \r
+                // Fixed: Only remove \r if it exists
+                if (!value.empty() && value.back() == '\r') {
+                    value.pop_back();
+                }
                 req.headers[key] = value;
             }
         }
@@ -97,14 +102,17 @@ private:
     
     // Handle client connection
     void handleClient(int client_socket) {
-        char buffer[4096] = {0};
-        int bytes_read = read(client_socket, buffer, 4096);
+        // Fixed: Use larger buffer and proper reading
+        const int BUFFER_SIZE = 8192;
+        char buffer[BUFFER_SIZE] = {0};
+        int bytes_read = read(client_socket, buffer, BUFFER_SIZE - 1); // Leave space for null terminator
         
         if (bytes_read <= 0) {
             close(client_socket);
             return;
         }
         
+        buffer[bytes_read] = '\0'; // Ensure null termination
         HttpRequest request = parseRequest(std::string(buffer));
         std::string response;
         
@@ -121,15 +129,25 @@ private:
         // Handle requests
         if (request.method == "GET" && request.path == "/status") {
             // Get drone status
-            json status = status_provider();
-            response = buildHttpResponse(200, "OK", status.dump());
+            if (status_provider) {
+                json status = status_provider();
+                response = buildHttpResponse(200, "OK", status.dump());
+            } else {
+                response = buildHttpResponse(500, "Internal Server Error", 
+                                           "{\"error\": \"Status provider not set\"}");
+            }
             
         } else if (request.method == "POST" && request.path == "/command") {
             // Execute command
             try {
-                json command = json::parse(request.body);
-                command_handler(command);
-                response = buildHttpResponse(200, "OK", "{\"success\": true}");
+                if (command_handler) {
+                    json command = json::parse(request.body);
+                    command_handler(command);
+                    response = buildHttpResponse(200, "OK", "{\"success\": true}");
+                } else {
+                    response = buildHttpResponse(500, "Internal Server Error", 
+                                               "{\"error\": \"Command handler not set\"}");
+                }
             } catch (const std::exception& e) {
                 json error;
                 error["error"] = e.what();
@@ -164,13 +182,17 @@ private:
             if (client_socket >= 0) {
                 std::thread client_thread(&DroneServer::handleClient, this, client_socket);
                 client_thread.detach();
+            } else if (running) {
+                // Only log error if we're still supposed to be running
+                std::cerr << "Accept failed: " << strerror(errno) << std::endl;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
         }
     }
     
     // Simple web interface
     std::string getWebInterface() {
-        return R"(
+        return R"HTML(
 <!DOCTYPE html>
 <html>
 <head>
@@ -259,8 +281,8 @@ private:
                 statusDiv.innerHTML = `
                     Armed: ${status.armed ? 'YES' : 'NO'}<br>
                     Flying: ${status.in_flight ? 'YES' : 'NO'}<br>
-                    Altitude: ${status.altitude.toFixed(2)}m<br>
-                    Battery: ${status.battery_voltage.toFixed(2)}V<br>
+                    Altitude: ${status.altitude ? status.altitude.toFixed(2) : '0.00'}m<br>
+                    Battery: ${status.battery_voltage ? status.battery_voltage.toFixed(2) : '0.00'}V<br>
                     GPS: ${status.gps_fix ? 'Fixed' : 'No Fix'}
                 `;
                 
@@ -277,11 +299,13 @@ private:
     </script>
 </body>
 </html>
-        )";
+        )HTML";
     }
     
 public:
     DroneServer(int port = 8080) : port(port) {
+        // Fixed: Seed random number generator
+        srand(static_cast<unsigned int>(time(nullptr)));
         // Generate random auth token
         auth_token = generateAuthToken();
         std::cout << "\n*** DRONE SERVER AUTH TOKEN: " << auth_token << " ***\n" << std::endl;
