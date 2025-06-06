@@ -1262,51 +1262,6 @@ void updateIMU() {
             }
         }
     }
-
-    // Print 360° obstacle status
-    void print360ObstacleStatus() {
-        std::cout << "\n=== 360° Obstacle Analysis (FHL-LD19) ===" << std::endl;
-        
-        // Find obstacles in each quadrant
-        struct Quadrant {
-            std::string name;
-            int start_angle;
-            int end_angle;
-            float min_distance;
-            int obstacle_count;
-        };
-        
-        Quadrant quadrants[4] = {
-            {"Front", 315, 45, 10.0f, 0},
-            {"Right", 45, 135, 10.0f, 0},
-            {"Back", 135, 225, 10.0f, 0},
-            {"Left", 225, 315, 10.0f, 0}
-        };
-        
-        // Analyze each quadrant
-        for (auto& quad : quadrants) {
-            for (int angle = quad.start_angle; angle != quad.end_angle; angle = (angle + 1) % 360) {
-                if (obstacle_map[angle] < 3.0f) {
-                    quad.obstacle_count++;
-                    quad.min_distance = std::min(quad.min_distance, obstacle_map[angle]);
-                }
-            }
-            
-            std::cout << quad.name << ": ";
-            if (quad.obstacle_count > 0) {
-                std::cout << quad.obstacle_count << " obstacles, closest at " 
-                         << quad.min_distance << "m";
-            } else {
-                std::cout << "Clear";
-            }
-            std::cout << std::endl;
-        }
-        
-        std::cout << "Safest direction: " << findSafestDirection() << "°" << std::endl;
-        std::cout << "Repulsion vector: X=" << repulsion_vector.x 
-                 << " Y=" << repulsion_vector.y 
-                 << " Magnitude=" << repulsion_vector.magnitude << std::endl;
-    }
     
     void sensorLoop() {
         auto last_time = std::chrono::steady_clock::now();
@@ -1564,6 +1519,51 @@ public:
         DroneState getState() const { 
         std::lock_guard<std::mutex> lock(state_mutex);
         return state; 
+    }
+
+    // Print 360° obstacle status
+    void print360ObstacleStatus() {
+        std::cout << "\n=== 360° Obstacle Analysis (FHL-LD19) ===" << std::endl;
+        
+        // Find obstacles in each quadrant
+        struct Quadrant {
+            std::string name;
+            int start_angle;
+            int end_angle;
+            float min_distance;
+            int obstacle_count;
+        };
+        
+        Quadrant quadrants[4] = {
+            {"Front", 315, 45, 10.0f, 0},
+            {"Right", 45, 135, 10.0f, 0},
+            {"Back", 135, 225, 10.0f, 0},
+            {"Left", 225, 315, 10.0f, 0}
+        };
+        
+        // Analyze each quadrant
+        for (auto& quad : quadrants) {
+            for (int angle = quad.start_angle; angle != quad.end_angle; angle = (angle + 1) % 360) {
+                if (obstacle_map[angle] < 3.0f) {
+                    quad.obstacle_count++;
+                    quad.min_distance = std::min(quad.min_distance, obstacle_map[angle]);
+                }
+            }
+            
+            std::cout << quad.name << ": ";
+            if (quad.obstacle_count > 0) {
+                std::cout << quad.obstacle_count << " obstacles, closest at " 
+                         << quad.min_distance << "m";
+            } else {
+                std::cout << "Clear";
+            }
+            std::cout << std::endl;
+        }
+        
+        std::cout << "Safest direction: " << findSafestDirection() << "°" << std::endl;
+        std::cout << "Repulsion vector: X=" << repulsion_vector.x 
+                 << " Y=" << repulsion_vector.y 
+                 << " Magnitude=" << repulsion_vector.magnitude << std::endl;
     }
 
     GPSData getGPSData() const { return gps_data; }
