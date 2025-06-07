@@ -22,8 +22,11 @@
 #include <algorithm>
 #include <queue>
 
-#include "drone_server.hpp"
 #include "nlohmann/json.hpp"
+
+#include "drone_server.hpp"
+#include "remote_control.hpp"
+#include "fleet_management.hpp"
 
 // Constants
 constexpr float PI = 3.14159265359f;
@@ -1909,6 +1912,150 @@ int main() {
     try {
         // Create flight controller
         FlightController fc;
+
+        // Remote Control Configuration
+        const std::string RELAY_SERVER = "your-server-ip-or-domain.com";  // Your VPS/cloud server
+        const int RELAY_PORT = 8443;  // SSL port
+        const std::string DRONE_ID = "DRONE001";  // Unique drone identifier
+        const std::string AUTH_TOKEN = "your-secure-auth-token";  // Must match relay server
+
+        // Create remote control client
+        RemoteControlClient remote(RELAY_SERVER, RELAY_PORT, DRONE_ID, AUTH_TOKEN);
+
+        // Create drone fleet info
+        DroneFleetInfo drone_info;
+        drone_info.drone_id = DRONE_ID;
+        drone_info.status = DRONE_IDLE;
+        drone_info.home_location.latitude = 51.507351;  // Set your home location
+        drone_info.home_location.longitude = -0.127758;
+        drone_info.home_location.altitude = 0;
+        drone_info.current_location = drone_info.home_location;
+        drone_info.battery_percentage = 100.0f;
+        drone_info.max_range = 20.0f;  // 20km
+        drone_info.cruise_speed = 10.0f;  // 10 m/s
+        drone_info.payload_capacity = 2.0f;  // 2kg
+        drone_info.has_camera = true;
+        drone_info.has_lidar = true;
+        drone_info.capabilities = {
+            {"delivery", true},
+            {"surveillance", true},
+            {"inspection", true},
+            {"night_flight", true}
+        };
+
+        // Enhanced command handler for waypoint missions
+        remote.setCommandHandler([&fc, &drone_info, &remote](const json& cmd) {
+            std::string command = cmd.value("command", "");
+            
+            if (cmd.contains("type") && cmd["type"] == MSG_WAYPOINT) {
+                // Handle autonomous waypoint mission
+                std::cout << "*** AUTONOMOUS MISSION STARTED ***" << std::endl;
+                std::cout << "Mission ID: " << cmd["data"]["mission_id"] << std::endl;
+                
+                // TODO: Implement waypoint navigation
+                // For now, just acknowledge
+                std::cout << "Waypoints received: " << cmd["data"]["waypoints"].size() << std::endl;
+                
+            } else if (command == "arm") {
+                fc.arm();
+            } else if (command == "disarm") {
+                fc.disarm();
+            } else if (command == "takeoff") {
+                fc.takeoff(cmd["altitude"]);
+            } else if (command == "land") {
+                fc.land();
+            } else if (command == "move") {
+                fc.move(cmd["forward"], cmd["right"], cmd["up"]);
+            } else if (command == "rotate") {
+                fc.rotate(cmd["degrees"]);
+            } else if (command == "hover") {
+                fc.hover();
+            } else if (command == "scan") {
+                fc.scanEnvironment();
+            } else if (command == "emergency_land") {
+                fc.land();
+                fc.disarm();
+            } else if (command == "return_home") {
+                std::cout << "*** RETURN TO HOME ***" << std::endl;
+                fc.flyToGPS(drone_info.home_location.latitude, 
+                        drone_info.home_location.longitude, 
+                        50.0f);  // 50m altitude for RTH
+            }
+            
+            remote.sendLog("INFO", "Command executed: " + command);
+        });
+
+        // Set telemetry provider
+        remote.setTelemetryProvider([&fc, &drone_info]() {
+            TelemetryData telemetry;
+            auto state = fc.getState();
+            auto gps = fc.getGPSData();
+            
+            telemetry.roll = state.roll * RAD_TO_DEG;
+            telemetry.pitch = state.pitch * RAD_TO_DEG;
+            telemetry.yaw = state.yaw * RAD_TO_DEG;
+            telemetry.altitude = state.z;
+            telemetry.speed = std::sqrt(state.vx * state.vx + state.vy * state.vy);
+            telemetry.battery_voltage = state.battery_voltage;
+            telemetry.latitude = gps.latitude;
+            telemetry.longitude = gps.longitude;
+            telemetry.gps_fix = gps.fix;
+            telemetry.satellites = gps.satellites;
+            telemetry.armed = state.armed;
+            telemetry.in_flight = state.in_flight;
+            telemetry.flight_mode = state.armed ? (state.in_flight ? "FLYING" : "ARMED") : "DISARMED";
+            telemetry.timestamp = std::chrono::system_clock::now().time_since_epoch().count();
+            
+            // Update drone info
+            if (gps.fix) {
+                drone_info.current_location.latitude = gps.latitude;
+                drone_info.current_location.longitude = gps.longitude;
+                drone_info.current_location.altitude = state.z;
+            }
+            drone_info.battery_percentage = (state.battery_voltage - 10.0f) / 2.6f * 100.0f;
+            
+            return telemetry;
+        });
+
+        // Set connection callback
+        remote.setConnectionCallback([&remote, &drone_info](ConnectionState state) {
+            switch (state) {
+                case CONNECTING:
+                    std::cout << "Connecting to remote control server..." << std::endl;
+                    break;
+                case CONNECTED: {
+                    std::cout << "*** CONNECTED TO FLEET MANAGEMENT ***" << std::endl;
+                    
+                    // Send drone registration
+                    json registration;
+                    registration["type"] = 100;  // Custom message type for registration
+                    registration["drone_info"] = {
+                        {"drone_id", drone_info.drone_id},
+                        {"max_range", drone_info.max_range},
+                        {"cruise_speed", drone_info.cruise_speed},
+                        {"payload_capacity", drone_info.payload_capacity},
+                        {"capabilities", drone_info.capabilities},
+                        {"home_location", {
+                            {"latitude", drone_info.home_location.latitude},
+                            {"longitude", drone_info.home_location.longitude}
+                        }}
+                    };
+                    remote.sendMessage(registration);
+                    break;
+                }
+                case DISCONNECTED:
+                    std::cout << "Disconnected from remote control" << std::endl;
+                    break;
+                case RECONNECTING:
+                    std::cout << "Reconnecting to remote control..." << std::endl;
+                    break;
+                default:
+                    break;
+            }
+        });
+
+        // Start remote control
+        remote.start();
         
         // Status monitoring thread
         std::thread status_thread([&fc]() {
@@ -1977,6 +2124,8 @@ server.setStatusProvider([&fc]() {
         // Clean shutdown
         g_shutdown = true;
         server.stop();  // Add this line
+        // Stop remote control
+        remote.stop();
         if (status_thread.joinable()) {
             status_thread.join();
         }

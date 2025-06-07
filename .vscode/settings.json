@@ -68,6 +68,22 @@
         "xutility": "cpp",
         "deque": "cpp",
         "queue": "cpp",
-        "random": "cpp"
+        "random": "cpp",
+        "any": "cpp",
+        "array": "cpp",
+        "codecvt": "cpp",
+        "condition_variable": "cpp",
+        "cstdarg": "cpp",
+        "cwctype": "cpp",
+        "map": "cpp",
+        "memory_resource": "cpp",
+        "numeric": "cpp",
+        "string_view": "cpp",
+        "numbers": "cpp",
+        "ranges": "cpp",
+        "semaphore": "cpp",
+        "cinttypes": "cpp",
+        "valarray": "cpp",
+        "variant": "cpp"
     }
 }

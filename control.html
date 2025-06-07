@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Remote Drone Control</title>
+    <script>
+        const ws = new WebSocket('wss://your-server.com:8443/control');
+        const AUTH_TOKEN = 'your-secure-auth-token';
+        const DRONE_ID = 'DRONE001';
+        
+        ws.onopen = () => {
+            console.log('Connected to relay');
+            // Authenticate
+            ws.send(JSON.stringify({
+                type: 7, // MSG_AUTH
+                auth_token: AUTH_TOKEN
+            }));
+        };
+        
+        function sendCommand(command, params = {}) {
+            ws.send(JSON.stringify({
+                type: 1, // MSG_COMMAND
+                drone_id: DRONE_ID,
+                data: { command, ...params }
+            }));
+        }
+    </script>
+</head>
+<body>
+    <h1>Drone Remote Control</h1>
+    <button onclick="sendCommand('arm')">ARM</button>
+    <button onclick="sendCommand('takeoff', {altitude: 5})">TAKEOFF</button>
+    <button onclick="sendCommand('land')">LAND</button>
+    <!-- Add more controls -->
+</body>
+</html>
