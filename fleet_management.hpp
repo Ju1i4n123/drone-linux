@@ -176,7 +176,7 @@ struct APIResponse {
 };
 
 // Write callback for CURL
-size_t curl_write_callback(void* contents, size_t size, size_t nmemb, std::string* userp) {
+size_t Write_Callback(void* contents, size_t size, size_t nmemb, std::string* userp) {
     userp->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
@@ -215,7 +215,7 @@ public:
         
         std::string response;
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, Write_Callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         curl_easy_setopt(curl, CURLOPT_USERAGENT, "DroneFleetManager/1.0");
         
@@ -245,7 +245,7 @@ public:
         
         std::string response;
         curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, Write_Callback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         curl_easy_setopt(curl, CURLOPT_USERAGENT, "DroneFleetManager/1.0");
         
